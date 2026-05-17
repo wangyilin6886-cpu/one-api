@@ -10,6 +10,15 @@ import (
 )
 
 func SetApiRouter(router *gin.Engine) {
+	// Internal service-to-service endpoints. Authenticated with HMAC, NOT
+	// behind the per-IP rate limiter, since the payment-service calls in
+	// bursts after webhook fan-in. Keep this group small and tightly scoped.
+	internalRouter := router.Group("/api/internal")
+	internalRouter.Use(middleware.InternalAuth())
+	{
+		internalRouter.POST("/topup", controller.InternalTopup)
+	}
+
 	apiRouter := router.Group("/api")
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
