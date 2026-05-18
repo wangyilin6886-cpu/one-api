@@ -1,5 +1,13 @@
 version: '3.4'
 
+# Indonesia top-up stack:
+#   - one-api          (port 3000)   - main LLM relay; consumes payment-service credits via /api/internal/topup
+#   - payment-service  (port 3001)   - Xendit gateway; PR #2 of the payment build-out
+#   - mysql            (port 3306)   - both services use this; payment uses a separate schema oneapi_payment
+#   - redis            (internal)    - one-api cache; optional, but enabled by default
+#
+# Environment overrides live in .env (sibling of this file). Sample at .env.example.
+
 services:
   one-api:
     image: "${REGISTRY:-docker.io}/justsong/one-api:latest"
@@ -12,38 +20,84 @@ services:
       - ./data/oneapi:/data
       - ./logs:/app/logs
     environment:
-      - SQL_DSN=oneapi:123456@tcp(db:3306)/one-api  # 修改此行，或注释掉以使用 SQLite 作为数据库
+      - SQL_DSN=oneapi:123456@tcp(db:3306)/one-api
       - REDIS_CONN_STRING=redis://redis
-      - SESSION_SECRET=random_string  # 修改为随机字符串
-      - TZ=Asia/Shanghai
-#      - NODE_TYPE=slave  # 多机部署时从节点取消注释该行
-#      - SYNC_FREQUENCY=60  # 需要定期从数据库加载数据时取消注释该行
-#      - FRONTEND_BASE_URL=https://openai.justsong.cn  # 多机部署时从节点取消注释该行
+      - SESSION_SECRET=${SESSION_SECRET:-please_set_in_env_file}
+      - TZ=Asia/Jakarta
+      # PR #1: shared with payment-service. Both sides MUST use the same value.
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
     depends_on:
       - redis
       - db
+    networks:
+      - internal_net
     healthcheck:
       test: [ "CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' | awk -F: '{print $2}'" ]
       interval: 30s
       timeout: 10s
       retries: 3
 
+  payment-service:
+    build:
+      context: ./payment
+      dockerfile: Dockerfile
+    container_name: payment-service
+    restart: always
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      # Separate schema on the same MySQL instance.
+      - DATABASE_URL=oneapi:123456@tcp(db:3306)/oneapi_payment?charset=utf8mb4&parseTime=True&loc=UTC
+      # Talk to one-api over the docker network.
+      - ONE_API_INTERNAL_URL=http://one-api:3000
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
+      # Xendit (test mode).
+      - XENDIT_SECRET_KEY=${XENDIT_SECRET_KEY}
+      - XENDIT_BASE_URL=${XENDIT_BASE_URL:-https://api.xendit.co}
+      # Public URL the payment-service is reachable at (used in webhook docs).
+      - PAYMENT_BASE_URL=${PAYMENT_BASE_URL:-http://localhost:3001}
+      - TZ=Asia/Jakarta
+    depends_on:
+      - db
+      - one-api
+    networks:
+      - internal_net
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q -O - http://localhost:3001/healthz | grep -q '\"success\":true' || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   redis:
     image: "${REGISTRY:-docker.io}/redis:latest"
     container_name: redis
     restart: always
+    networks:
+      - internal_net
 
   db:
     image: "${REGISTRY:-docker.io}/mysql:8.2.0"
     restart: always
     container_name: mysql
     volumes:
-      - ./data/mysql:/var/lib/mysql  # 挂载目录，持久化存储
+      - ./data/mysql:/var/lib/mysql
+      # Auto-creates the payment-service schema on first boot.
+      - ./payment/migrations/00_create_schema.sql:/docker-entrypoint-initdb.d/00_create_schema.sql:ro
     ports:
       - '3306:3306'
     environment:
-      TZ: Asia/Shanghai   # 设置时区
-      MYSQL_ROOT_PASSWORD: 'OneAPI@justsong' # 设置 root 用户的密码
-      MYSQL_USER: oneapi   # 创建专用用户
-      MYSQL_PASSWORD: '123456'    # 设置专用用户密码
-      MYSQL_DATABASE: one-api   # 自动创建数据库
+      TZ: Asia/Jakarta
+      MYSQL_ROOT_PASSWORD: 'OneAPI@justsong'
+      MYSQL_USER: oneapi
+      MYSQL_PASSWORD: '123456'
+      MYSQL_DATABASE: one-api
+    networks:
+      - internal_net
+
+networks:
+  internal_net:
+    driver: bridge
