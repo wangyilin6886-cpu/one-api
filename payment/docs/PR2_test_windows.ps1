@@ -160,14 +160,51 @@ function Send-QRISWebhook {
 
 # ---------------------------------------------------------------------
 # DB helpers - docker exec into the mysql container
+#
+# Two gotchas this function works around:
+#
+#  1. $args is a PowerShell *automatic* variable. Reassigning it inside a
+#     function silently misbehaves on some PS hosts (the @args splat then
+#     uses the parent scope's value). Use $mysqlArgs instead.
+#
+#  2. mysql client writes the "Using a password on the command line is
+#     insecure" *warning* to stderr. Combined with $ErrorActionPreference =
+#     "Stop" at the top of this script, that stderr line previously made
+#     this very function throw a terminating error - hence the "cannot
+#     reach mysql container" false positive even when the container was
+#     perfectly healthy.
+#
+#     Fix: pass the password via the MYSQL_PWD env var (docker exec -e ...).
+#     The mysql client reads it from the env and doesn't emit the warning.
 # ---------------------------------------------------------------------
 function Invoke-MySQL {
     param([string]$DB, [string]$Sql)
-    $args = @("exec", $MySQLContainer, "mysql",
-              "-u$MySQLUser", "-p$MySQLPass", "-N", "-B",
-              "-e", $Sql, $DB)
-    # 2>&1 captures the password-warning stderr; harmless.
-    return (& docker @args 2>&1) | Where-Object { $_ -notmatch "Using a password" }
+    $mysqlArgs = @(
+        "exec",
+        "-e", "MYSQL_PWD=$MySQLPass",       # avoid stderr warning entirely
+        $MySQLContainer,
+        "mysql",
+        "-u$MySQLUser",
+        "-N", "-B",                         # batch / silent mode (TSV)
+        "-e", $Sql,
+        $DB
+    )
+    # Belt-and-suspenders: even with MYSQL_PWD, certain mysql 8.0 builds
+    # still print other warnings on stderr (e.g. about character sets).
+    # Run with ErrorActionPreference temporarily relaxed so a stderr
+    # write from the child process doesn't blow up the script.
+    $prev = $global:ErrorActionPreference
+    $global:ErrorActionPreference = "Continue"
+    try {
+        $output = & docker @mysqlArgs 2>$null
+        $exit = $LASTEXITCODE
+    } finally {
+        $global:ErrorActionPreference = $prev
+    }
+    if ($exit -ne 0) {
+        Write-Host "    docker exec mysql exited $exit; sql=$Sql" -ForegroundColor DarkYellow
+    }
+    return $output
 }
 
 function Get-OrderRow {
@@ -205,12 +242,19 @@ Write-Host " PR #2 payment-service end-to-end test"                            -
 Write-Host " payment=$PaymentBase  one-api=$OneAPIBase  user=$TestUserId"      -ForegroundColor White
 Write-Host "================================================================" -ForegroundColor White
 
-# Probe MySQL container is up.
-try {
-    $probe = Invoke-MySQL -DB $PaymentDB -Sql "SELECT 1;"
-    if (-not $probe) { throw "no rows" }
-} catch {
-    Write-Host "ERROR: cannot reach mysql container '$MySQLContainer'. Is docker-compose running?" -ForegroundColor Red
+# Probe MySQL container is up. Make the diagnostic verbose so future failures
+# don't get blamed on a generic "unreachable" when the underlying cause might
+# be wrong creds, wrong container name, schema not migrated, etc.
+$probe = Invoke-MySQL -DB $PaymentDB -Sql "SELECT 1;"
+if (-not $probe -or ($probe -join "") -notmatch "1") {
+    Write-Host "ERROR: cannot reach mysql container '$MySQLContainer' or schema '$PaymentDB' missing." -ForegroundColor Red
+    Write-Host "  Tried: docker exec -e MYSQL_PWD=*** $MySQLContainer mysql -u$MySQLUser -N -B -e 'SELECT 1;' $PaymentDB" -ForegroundColor Yellow
+    Write-Host "  Got: $($probe -join ' / ')" -ForegroundColor Yellow
+    Write-Host "  Hints:" -ForegroundColor Yellow
+    Write-Host "    - 'docker ps' shows the mysql container? (default name: 'mysql')" -ForegroundColor Yellow
+    Write-Host "    - schema '$PaymentDB' exists? (CREATE DATABASE oneapi_payment;)" -ForegroundColor Yellow
+    Write-Host "    - user '$MySQLUser' has access to '$PaymentDB'? (see payment/migrations/00_create_schema.sql)" -ForegroundColor Yellow
+    Write-Host "    - if your container has a different name, pass -MySQLContainer <name>" -ForegroundColor Yellow
     exit 1
 }
 
