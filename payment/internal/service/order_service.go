@@ -9,44 +9,55 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	"github.com/songquanpeng/one-api/payment/internal/logger"
 	"github.com/songquanpeng/one-api/payment/internal/model"
+	"github.com/songquanpeng/one-api/payment/internal/provider"
 	"github.com/songquanpeng/one-api/payment/internal/repository"
-	"github.com/songquanpeng/one-api/payment/internal/xendit"
 )
 
-// QuotaPerUnit mirrors one-api's `config.QuotaPerUnit` constant. 1 USD = 500,000 quota.
-// Hard-coded here because the payment-service is intentionally decoupled from
-// one-api's internals - importing one-api's config would re-couple them.
+// QuotaPerUnit mirrors one-api's `config.QuotaPerUnit` constant (500_000
+// quota per 1 USD). Hard-coded so the payment-service stays decoupled
+// from one-api's internals; if one-api ever changes this you'd update
+// the constant here too.
 const QuotaPerUnit = int64(500_000)
+
+// QuotaFromCents converts a USD-cents amount to quota with floor semantics.
+// We always floor so the user gets at most what they paid for - never
+// half a quota unit more.
+//
+//   $5  = 500   cents -> floor(500   * 500_000 / 100) = 2_500_000  quota
+//   $19 = 1900  cents -> floor(1900  * 500_000 / 100) = 9_500_000  quota
+//   $99 = 9900  cents -> floor(9900  * 500_000 / 100) = 49_500_000 quota
+func QuotaFromCents(cents int64) int64 {
+	return cents * QuotaPerUnit / 100
+}
 
 // OrderService orchestrates order creation, lookup, and state transitions.
 // All state-changing operations run inside a DB transaction.
 type OrderService struct {
-	db            *gorm.DB
-	orderRepo     *repository.OrderRepo
-	configRepo    *repository.PaymentConfigRepo
-	xendit        *xendit.Client
-	alerter       Alerter
-	now           func() time.Time // injectable clock for tests
+	db         *gorm.DB
+	orderRepo  *repository.OrderRepo
+	configRepo *repository.PaymentConfigRepo
+	provider   provider.PaymentProvider
+	alerter    Alerter
+	now        func() time.Time // injectable clock for tests
 }
 
 func NewOrderService(
 	db *gorm.DB,
 	orderRepo *repository.OrderRepo,
 	configRepo *repository.PaymentConfigRepo,
-	xc *xendit.Client,
+	p provider.PaymentProvider,
 	alerter Alerter,
 ) *OrderService {
 	return &OrderService{
 		db:         db,
 		orderRepo:  orderRepo,
 		configRepo: configRepo,
-		xendit:     xc,
+		provider:   p,
 		alerter:    alerter,
 		now:        func() time.Time { return time.Now().UTC() },
 	}
@@ -54,66 +65,66 @@ func NewOrderService(
 
 // CreateOrderParams is the validated, normalized input for CreateOrder.
 type CreateOrderParams struct {
-	UserId        int
-	AmountIDR     int64
-	PaymentMethod model.PaymentMethod
-	PayerName     string // shown in BCA mobile for VA; ignored for QRIS
-	ClientIP      string
-	UserAgent     string
+	UserId         int
+	AmountUSDCents int64
+	Currency       string // "USD" only in v1
+	CustomerEmail  string // forwarded to provider for the receipt
+	ClientIP       string
+	UserAgent      string
 }
 
-// ErrXxx is the catalog of errors CreateOrder returns. The handler maps them
-// to error codes/HTTP status.
+// Catalog of errors CreateOrder can return. Handlers translate to error codes.
 var (
 	ErrAmountTooLow      = errors.New("amount below minimum")
 	ErrAmountTooHigh     = errors.New("amount above maximum")
-	ErrUnsupportedMethod = errors.New("payment method not supported in this version")
+	ErrUnsupportedCurrency = errors.New("currency not supported in v1 (USD only)")
 	ErrInvalidConfig     = errors.New("payment_config is invalid")
+	ErrProviderFailed    = errors.New("provider checkout creation failed")
 )
 
 // CreateOrder runs the full creation flow:
-//  1. Read runtime config (min/max amount, exchange rate, expiry).
-//  2. Validate amount.
-//  3. Compute locked quota_to_credit.
+//  1. Read runtime config (min/max amount, expiry).
+//  2. Validate amount + currency.
+//  3. Lock quota_to_credit via QuotaFromCents (immutable on the row).
 //  4. Generate order_no; INSERT pending order. (Retry on unique collision.)
-//  5. Call Xendit to create the QR / VA resource.
-//  6. On success: persist xendit ids + qr_string / va_number.
-//     On failure: transition order to failed with failure_reason.
+//  5. Ask the provider to create a hosted checkout session.
+//  6. On success: persist provider_checkout_id + checkout_url.
+//     On failure: transition order to `failed` with failure_reason.
 func (s *OrderService) CreateOrder(ctx context.Context, p CreateOrderParams) (*model.Order, error) {
-	if p.PaymentMethod != model.MethodQRIS && p.PaymentMethod != model.MethodVABCA {
-		return nil, ErrUnsupportedMethod
+	if p.Currency == "" {
+		p.Currency = "USD"
+	}
+	if p.Currency != "USD" {
+		return nil, ErrUnsupportedCurrency
 	}
 
-	minAmt, maxAmt, expiryMin, rate, err := s.readRuntimeConfig(ctx)
+	minC, maxC, expiryMin, err := s.readRuntimeConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if p.AmountIDR < minAmt {
+	if p.AmountUSDCents < minC {
 		return nil, ErrAmountTooLow
 	}
-	if p.AmountIDR > maxAmt {
+	if p.AmountUSDCents > maxC {
 		return nil, ErrAmountTooHigh
 	}
 
-	// Correction 3: lock the exchange rate at creation time. Compute
-	// quota_to_credit with floor (decimal division then floor) so users get
-	// at most what they paid for - never more. Edits to the rate after
-	// this point never affect this order.
-	amountDec := decimal.NewFromInt(p.AmountIDR)
-	quotaDec := amountDec.
-		Mul(decimal.NewFromInt(QuotaPerUnit)).
-		Div(rate)
-	quota := quotaDec.Floor().IntPart()
+	quota := QuotaFromCents(p.AmountUSDCents)
 	if quota <= 0 {
-		return nil, fmt.Errorf("computed quota is non-positive (amount=%d rate=%s): %w",
-			p.AmountIDR, rate.String(), ErrInvalidConfig)
+		return nil, fmt.Errorf("computed quota is non-positive (cents=%d): %w",
+			p.AmountUSDCents, ErrInvalidConfig)
 	}
 
 	now := s.now()
 	expiresAt := now.Add(time.Duration(expiryMin) * time.Minute)
 
-	// 5 attempts is overkill (we're using 16 random chars - collisions are
-	// astronomically rare) but cheap; protects against a freak collision.
+	// Insert a `pending` order first, BEFORE calling the provider. This
+	// way, if the provider call succeeds but our network drops on the way
+	// back, the order is still on file and a future reconciliation can
+	// match it to the provider-side checkout.
+	//
+	// 5 attempts on order_no collision is overkill given a 16-char random
+	// suffix, but cheap.
 	const insertAttempts = 5
 	var order *model.Order
 	for i := 0; i < insertAttempts; i++ {
@@ -122,18 +133,19 @@ func (s *OrderService) CreateOrder(ctx context.Context, p CreateOrderParams) (*m
 			return nil, fmt.Errorf("generate order_no: %w", err)
 		}
 		candidate := &model.Order{
-			OrderNo:       orderNo,
-			UserId:        p.UserId,
-			AmountIDR:     p.AmountIDR,
-			ExchangeRate:  rate,
-			QuotaToCredit: quota,
-			PaymentMethod: p.PaymentMethod,
-			Status:        model.StatusPending,
-			CreatedAt:     now,
-			ExpiresAt:     expiresAt,
-			ClientIP:      p.ClientIP,
-			UserAgent:     truncate(p.UserAgent, 255),
-			UpdatedAt:     now,
+			OrderNo:        orderNo,
+			UserId:         p.UserId,
+			OrderType:      model.OrderTypeTopup,
+			AmountUSDCents: p.AmountUSDCents,
+			Currency:       p.Currency,
+			QuotaToCredit:  quota,
+			Provider:       s.provider.Name(),
+			Status:         model.StatusPending,
+			CreatedAt:      now,
+			ExpiresAt:      expiresAt,
+			ClientIP:       p.ClientIP,
+			UserAgent:      truncate(p.UserAgent, 255),
+			UpdatedAt:      now,
 		}
 		err = s.orderRepo.Create(ctx, nil, candidate)
 		if err == nil {
@@ -150,61 +162,47 @@ func (s *OrderService) CreateOrder(ctx context.Context, p CreateOrderParams) (*m
 		return nil, errors.New("could not insert order after retries")
 	}
 
-	// Now call Xendit. Failures transition the order to "failed" - keeping
-	// the row visible for audit, freeing the order_no for nothing in
-	// particular (we don't reuse it; a new order is a new order_no).
-	xenditCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // covers retries
+	// Call the provider. 30s overall budget covers internal retries.
+	provCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	switch p.PaymentMethod {
-	case model.MethodQRIS:
-		if err := s.attachQRIS(xenditCtx, order, expiresAt); err != nil {
-			return order, s.failOrder(ctx, order, "qris_create_failed", err)
-		}
-	case model.MethodVABCA:
-		if err := s.attachVABCA(xenditCtx, order, p.PayerName, expiresAt); err != nil {
-			return order, s.failOrder(ctx, order, "va_create_failed", err)
-		}
+	chk, err := s.provider.CreateCheckout(provCtx, provider.CheckoutParams{
+		OrderNo:        order.OrderNo,
+		UserId:         p.UserId,
+		AmountUSDCents: p.AmountUSDCents,
+		Currency:       p.Currency,
+		CustomerEmail:  p.CustomerEmail,
+		IdempotencyKey: order.OrderNo, // same key for retries of the same logical order
+	})
+	if err != nil {
+		s.alerter.ProviderError(ctx, order.OrderNo, "create_checkout", err)
+		return order, s.failOrder(ctx, order, "provider_checkout_failed", err)
 	}
 
-	// Reload so caller sees the freshly-attached Xendit fields.
+	// Persist checkout reference + URL.
+	if err := s.orderRepo.UpdateStatusAndFields(ctx, nil, order.OrderNo, model.StatusPending, map[string]any{
+		"provider_checkout_id": chk.ProviderCheckoutId,
+		"checkout_url":         chk.CheckoutURL,
+	}); err != nil {
+		// We have a real checkout at the provider but lost the URL locally.
+		// Escalate; an operator can fetch the URL from the provider dashboard
+		// and patch the row.
+		s.alerter.NeedsManualReview(ctx, order.OrderNo,
+			"checkout created at provider but DB update failed",
+			zap.String("provider_checkout_id", chk.ProviderCheckoutId),
+			zap.Error(err))
+		return order, fmt.Errorf("persist checkout url: %w", err)
+	}
+
+	// Reload so caller sees the freshly-attached fields.
 	return s.orderRepo.GetByOrderNo(ctx, order.OrderNo)
-}
-
-func (s *OrderService) attachQRIS(ctx context.Context, o *model.Order, expiresAt time.Time) error {
-	resp, err := s.xendit.CreateQRCode(ctx, o.OrderNo, o.AmountIDR, expiresAt)
-	if err != nil {
-		s.alerter.XenditError(ctx, o.OrderNo, "create_qr", err)
-		return err
-	}
-	return s.orderRepo.UpdateStatusAndFields(ctx, nil, o.OrderNo, model.StatusPending, map[string]any{
-		"xendit_payment_id":      resp.Id,
-		"xendit_payment_channel": "QRIS",
-		"qr_string":              resp.QRString,
-	})
-}
-
-func (s *OrderService) attachVABCA(ctx context.Context, o *model.Order, payerName string, expiresAt time.Time) error {
-	if payerName == "" {
-		payerName = "OneAPI User"
-	}
-	resp, err := s.xendit.CreateVirtualAccount(ctx, o.OrderNo, "BCA", payerName, o.AmountIDR, expiresAt)
-	if err != nil {
-		s.alerter.XenditError(ctx, o.OrderNo, "create_va", err)
-		return err
-	}
-	return s.orderRepo.UpdateStatusAndFields(ctx, nil, o.OrderNo, model.StatusPending, map[string]any{
-		"xendit_payment_id":      resp.Id,
-		"xendit_payment_channel": "BCA",
-		"va_number":              resp.AccountNumber,
-	})
 }
 
 // failOrder transitions order -> failed and records the reason. Returns the
 // original error so the caller can surface it to the handler.
 func (s *OrderService) failOrder(ctx context.Context, o *model.Order, reason string, cause error) error {
 	patch := map[string]any{
-		"failure_reason": truncate(reason+": "+cause.Error(), 128),
+		"failure_reason": truncate(reason+": "+cause.Error(), 255),
 	}
 	if err := s.orderRepo.UpdateStatusAndFields(ctx, nil, o.OrderNo, model.StatusFailed, patch); err != nil {
 		logger.L(ctx).Error("failed to mark order failed",
@@ -218,20 +216,19 @@ func (s *OrderService) GetOrder(ctx context.Context, orderNo string) (*model.Ord
 	return s.orderRepo.GetByOrderNo(ctx, orderNo)
 }
 
-// readRuntimeConfig loads all the order-creation knobs from payment_config.
+// readRuntimeConfig loads the order-creation knobs from payment_config.
 func (s *OrderService) readRuntimeConfig(ctx context.Context) (
-	minAmt, maxAmt int64, expiryMin int, rate decimal.Decimal, err error,
+	minCents, maxCents int64, expiryMin int, err error,
 ) {
 	all, err := s.configRepo.GetAll(ctx)
 	if err != nil {
-		return 0, 0, 0, decimal.Zero, fmt.Errorf("load runtime config: %w", err)
+		return 0, 0, 0, fmt.Errorf("load runtime config: %w", err)
 	}
-
-	minAmt, err = readInt64(all, model.CfgMinTopupAmountIDR, 10_000)
+	minCents, err = readInt64(all, model.CfgMinTopupCents, 500)
 	if err != nil {
 		return
 	}
-	maxAmt, err = readInt64(all, model.CfgMaxTopupAmountIDR, 10_000_000)
+	maxCents, err = readInt64(all, model.CfgMaxTopupCents, 200_000)
 	if err != nil {
 		return
 	}
@@ -240,15 +237,6 @@ func (s *OrderService) readRuntimeConfig(ctx context.Context) (
 		return
 	}
 	expiryMin = int(expiryMinI64)
-
-	rate, err = readDecimal(all, model.CfgExchangeRateIDRPerUSD, "16500")
-	if err != nil {
-		return
-	}
-	if rate.LessThanOrEqual(decimal.Zero) {
-		err = fmt.Errorf("%w: exchange rate must be > 0", ErrInvalidConfig)
-		return
-	}
 	return
 }
 
@@ -264,20 +252,10 @@ func readInt64(m map[string]string, key string, def int64) (int64, error) {
 	return n, nil
 }
 
-func readDecimal(m map[string]string, key, def string) (decimal.Decimal, error) {
-	v, ok := m[key]
-	if !ok || v == "" {
-		v = def
-	}
-	d, err := decimal.NewFromString(v)
-	if err != nil {
-		return decimal.Zero, fmt.Errorf("%w: %s is not decimal (%q)", ErrInvalidConfig, key, v)
-	}
-	return d, nil
-}
-
 // generateOrderNo produces a 27-char order_no in the format
-// "IDR" + YYYYMMDD + 16-char random alphanumeric (uppercase + digits).
+// "ORD" + YYYYMMDD + 16-char random alphanumeric (uppercase + digits).
+// Format chosen to stay <= 32 chars (matches DB column width) and to give
+// support staff a date hint at a glance.
 func generateOrderNo(now time.Time) (string, error) {
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	const randLen = 16
@@ -289,7 +267,7 @@ func generateOrderNo(now time.Time) (string, error) {
 		}
 		buf[i] = alphabet[n.Int64()]
 	}
-	return "IDR" + now.UTC().Format("20060102") + string(buf), nil
+	return "ORD" + now.UTC().Format("20060102") + string(buf), nil
 }
 
 func truncate(s string, max int) string {

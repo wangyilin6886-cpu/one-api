@@ -1,12 +1,14 @@
 version: '3.4'
 
-# Indonesia top-up stack:
-#   - one-api          (port 3000)   - main LLM relay; consumes payment-service credits via /api/internal/topup
-#   - payment-service  (port 3001)   - Xendit gateway; PR #2 of the payment build-out
-#   - mysql            (port 3306)   - both services use this; payment uses a separate schema oneapi_payment
-#   - redis            (internal)    - one-api cache; optional, but enabled by default
+# Global LLM gateway stack:
+#   - one-api          (port 3000)   main LLM relay, credits user quota
+#   - payment-service  (port 3001)   Polar (MoR) gateway for global card payments
+#   - mysql            (port 3306)   both services share this; payment uses
+#                                    a separate schema oneapi_payment
+#   - redis            (internal)    one-api cache; optional
 #
-# Environment overrides live in .env (sibling of this file). Sample at .env.example.
+# Environment overrides live in .env (sibling of this file).
+# Sample at .env.example.
 
 services:
   one-api:
@@ -23,7 +25,7 @@ services:
       - SQL_DSN=oneapi:123456@tcp(db:3306)/one-api
       - REDIS_CONN_STRING=redis://redis
       - SESSION_SECRET=${SESSION_SECRET:-please_set_in_env_file}
-      - TZ=Asia/Jakarta
+      - TZ=UTC
       # PR #1: shared with payment-service. Both sides MUST use the same value.
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
     depends_on:
@@ -49,17 +51,17 @@ services:
       - PORT=3001
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - LOG_FORMAT=${LOG_FORMAT:-json}
-      # Separate schema on the same MySQL instance.
       - DATABASE_URL=oneapi:123456@tcp(db:3306)/oneapi_payment?charset=utf8mb4&parseTime=True&loc=UTC
-      # Talk to one-api over the docker network.
+      # one-api integration (PR #1).
       - ONE_API_INTERNAL_URL=http://one-api:3000
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
-      # Xendit (test mode).
-      - XENDIT_SECRET_KEY=${XENDIT_SECRET_KEY}
-      - XENDIT_BASE_URL=${XENDIT_BASE_URL:-https://api.xendit.co}
-      # Public URL the payment-service is reachable at (used in webhook docs).
+      # Polar provider. Webhook secret + org id + product id live in
+      # payment_config (admin-editable); only the access token is here.
+      - POLAR_ACCESS_TOKEN=${POLAR_ACCESS_TOKEN}
+      - POLAR_SANDBOX=${POLAR_SANDBOX:-true}
+      # Public URL the payment-service is reachable at (for webhook docs).
       - PAYMENT_BASE_URL=${PAYMENT_BASE_URL:-http://localhost:3001}
-      - TZ=Asia/Jakarta
+      - TZ=UTC
     depends_on:
       - db
       - one-api
@@ -90,7 +92,7 @@ services:
     ports:
       - '3306:3306'
     environment:
-      TZ: Asia/Jakarta
+      TZ: UTC
       MYSQL_ROOT_PASSWORD: 'OneAPI@justsong'
       MYSQL_USER: oneapi
       MYSQL_PASSWORD: '123456'

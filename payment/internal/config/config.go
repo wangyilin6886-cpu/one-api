@@ -1,10 +1,6 @@
 // Package config holds bootstrap configuration sourced from environment
-// variables. Runtime-tunable configuration (exchange rate, webhook tokens,
-// IP whitelist, etc.) lives in the payment_config table - see
-// internal/repository.PaymentConfigRepo for that.
-//
-// All env vars are read once in Load(). After that, the *Config struct is
-// passed around explicitly; we do NOT use global state for runtime config.
+// variables. Runtime-tunable configuration (Polar secrets, min/max amounts,
+// etc.) lives in the payment_config table - see repository.PaymentConfigRepo.
 package config
 
 import (
@@ -16,42 +12,38 @@ import (
 	"time"
 )
 
-// Config is the immutable bootstrap config. Runtime config (read from DB)
-// is fetched via the PaymentConfigRepo and cached in memory.
+// Config is the immutable bootstrap config.
 type Config struct {
-	Port             int
-	LogLevel         string
-	LogFormat        string
+	Port      int
+	LogLevel  string
+	LogFormat string
 
-	// Database (MySQL). DSN should already include the schema.
 	DatabaseURL      string
 	DatabaseLogLevel string
 
-	// Outgoing call to one-api's internal topup endpoint.
-	OneAPIBaseURL          string        // e.g. http://one-api:3000
-	OneAPIInternalSecret   string        // shared with one-api's INTERNAL_API_SECRET (PR #1)
-	OneAPITimeout          time.Duration // per attempt
+	// Outgoing call to one-api's internal topup endpoint (PR #1).
+	OneAPIBaseURL        string
+	OneAPIInternalSecret string
+	OneAPITimeout        time.Duration
+	OneAPIUserAuthPath   string
 
-	// Outgoing call to one-api for user validation (Authorization passthrough).
-	OneAPIUserAuthPath string // default /api/user/self
+	// Polar provider config. The webhook secret, org id, and product id
+	// live in payment_config (runtime-editable). The access token is sensitive
+	// enough that we keep it in env vars only.
+	PolarAccessToken string
+	PolarSandbox     bool
+	PolarBaseURL     string // optional override
 
-	// Xendit
-	XenditSecretKey string        // basic-auth username; password is empty per Xendit docs
-	XenditBaseURL   string        // default https://api.xendit.co
-	XenditTimeout   time.Duration // per attempt
-	XenditRetries   int           // including the first attempt
-
-	// Public base URL of the payment-service, used to build webhook URLs
-	// and (optionally) hosted checkout return URLs.
+	// Public base URL of this service.
 	PaymentBaseURL string
 
-	// Runtime config cache TTL.
+	// In-memory cache TTL for payment_config rows.
 	RuntimeConfigCacheTTL time.Duration
 
 	// Cron intervals.
 	ExpireSweepInterval time.Duration
 	TopupRetryInterval  time.Duration
-	TopupRetryMaxAge    time.Duration // give up retrying after this
+	TopupRetryMaxAge    time.Duration
 }
 
 // Load reads env vars and validates required fields.
@@ -66,10 +58,9 @@ func Load() (*Config, error) {
 		OneAPIInternalSecret:  os.Getenv("INTERNAL_API_SECRET"),
 		OneAPITimeout:         envDurDefault("ONE_API_TIMEOUT", 5*time.Second),
 		OneAPIUserAuthPath:    envStrDefault("ONE_API_USER_AUTH_PATH", "/api/user/self"),
-		XenditSecretKey:       os.Getenv("XENDIT_SECRET_KEY"),
-		XenditBaseURL:         envStrDefault("XENDIT_BASE_URL", "https://api.xendit.co"),
-		XenditTimeout:         envDurDefault("XENDIT_TIMEOUT", 10*time.Second),
-		XenditRetries:         envIntDefault("XENDIT_RETRIES", 3),
+		PolarAccessToken:      os.Getenv("POLAR_ACCESS_TOKEN"),
+		PolarSandbox:          envBoolDefault("POLAR_SANDBOX", true),
+		PolarBaseURL:          os.Getenv("POLAR_BASE_URL"),
 		PaymentBaseURL:        strings.TrimRight(os.Getenv("PAYMENT_BASE_URL"), "/"),
 		RuntimeConfigCacheTTL: envDurDefault("RUNTIME_CONFIG_CACHE_TTL", 5*time.Minute),
 		ExpireSweepInterval:   envDurDefault("EXPIRE_SWEEP_INTERVAL", 1*time.Minute),
@@ -86,8 +77,8 @@ func Load() (*Config, error) {
 	if len(c.OneAPIInternalSecret) < 32 {
 		return nil, errors.New("INTERNAL_API_SECRET must be at least 32 chars (matches one-api PR #1)")
 	}
-	if c.XenditSecretKey == "" {
-		return nil, errors.New("XENDIT_SECRET_KEY is required")
+	if c.PolarAccessToken == "" {
+		return nil, errors.New("POLAR_ACCESS_TOKEN is required")
 	}
 	return c, nil
 }
@@ -108,6 +99,18 @@ func envIntDefault(key string, def int) int {
 	return def
 }
 
+func envBoolDefault(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return def
+}
+
 func envDurDefault(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -120,12 +123,22 @@ func envDurDefault(key string, def time.Duration) time.Duration {
 // String returns a redacted summary safe for logs.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"Config{Port=%d OneAPI=%s Xendit=%s PaymentBase=%s ExpireSweep=%s "+
-			"OneAPISecret=%s* XenditKey=%s*}",
-		c.Port, c.OneAPIBaseURL, c.XenditBaseURL, c.PaymentBaseURL,
+		"Config{Port=%d OneAPI=%s Polar=%s(sandbox=%v) PaymentBase=%s ExpireSweep=%s "+
+			"OneAPISecret=%s* PolarToken=%s*}",
+		c.Port, c.OneAPIBaseURL, c.polarEffectiveBase(), c.PolarSandbox, c.PaymentBaseURL,
 		c.ExpireSweepInterval,
-		redact(c.OneAPIInternalSecret), redact(c.XenditSecretKey),
+		redact(c.OneAPIInternalSecret), redact(c.PolarAccessToken),
 	)
+}
+
+func (c *Config) polarEffectiveBase() string {
+	if c.PolarBaseURL != "" {
+		return c.PolarBaseURL
+	}
+	if c.PolarSandbox {
+		return "https://sandbox-api.polar.sh"
+	}
+	return "https://api.polar.sh"
 }
 
 func redact(s string) string {

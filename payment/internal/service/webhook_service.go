@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -12,32 +11,40 @@ import (
 
 	"github.com/songquanpeng/one-api/payment/internal/logger"
 	"github.com/songquanpeng/one-api/payment/internal/model"
+	"github.com/songquanpeng/one-api/payment/internal/provider"
 	"github.com/songquanpeng/one-api/payment/internal/repository"
 )
 
-// WebhookService is the orchestrator for incoming Xendit webhooks.
+// WebhookService orchestrates inbound webhook events from the payment
+// provider.
 //
-// FIVE-LAYER IDEMPOTENCY DEFENSE (corrections 5 & 6 of the spec):
-//   1. IP whitelist                              -> middleware/xendit_ip_whitelist.go
-//   2. Shared-token verification                 -> middleware/xendit_token.go
-//   3. UNIQUE(event_type, xendit_resource_id)    -> here (webhook_events table)
-//   4. Order state machine                       -> here (Lock + IsPostPayTerminal)
-//   5. UNIQUE(order_no, action_type) on topup_callbacks + one-api UNIQUE(order_no, action) -> here + PR #1
+// FIVE-LAYER IDEMPOTENCY DEFENSE:
 //
-// On a late paid-webhook against an expired / canceled / failed order:
-//   - DO NOT credit. (Corrections 1, 2.)
-//   - Move order -> needs_manual_review.
-//   - Mark webhook process_result = ignored_expired.
-//   - Append a metadata snippet to the order.
+//   1. Provider signature verification          -> middleware/polar_signature.go (PR-B)
+//   2. (reserved)                               -> we used to do IP whitelisting for Xendit;
+//                                                  Polar uses HMAC signatures over the body,
+//                                                  no IP allowlist needed.
+//   3. UNIQUE(event_type, provider_resource_id) -> here (webhook_events table)
+//   4. Order state machine                      -> here (Lock + IsPostPayTerminal)
+//   5. UNIQUE(order_no, action_type) on topup_callbacks
+//      + one-api's UNIQUE(order_no, action) on internal_topup_records (PR #1)
+//                                              -> here + one-api side
+//
+// Late-callback handling: on a `checkout.completed`-style webhook arriving
+// after the order is already expired/canceled/failed:
+//   - DO NOT credit.
+//   - Move the order -> needs_manual_review.
+//   - Append a metadata snippet for forensics.
 //   - Page humans via Alerter.
 type WebhookService struct {
-	db            *gorm.DB
-	orderRepo     *repository.OrderRepo
-	webhookRepo   *repository.WebhookRepo
-	topupCBRepo   *repository.TopupCallbackRepo
-	topupClient   *TopupClient
-	alerter       Alerter
-	now           func() time.Time
+	db          *gorm.DB
+	orderRepo   *repository.OrderRepo
+	webhookRepo *repository.WebhookRepo
+	topupCBRepo *repository.TopupCallbackRepo
+	topupClient *TopupClient
+	provider    provider.PaymentProvider
+	alerter     Alerter
+	now         func() time.Time
 }
 
 func NewWebhookService(
@@ -46,6 +53,7 @@ func NewWebhookService(
 	webhookRepo *repository.WebhookRepo,
 	topupCBRepo *repository.TopupCallbackRepo,
 	topupClient *TopupClient,
+	prov provider.PaymentProvider,
 	alerter Alerter,
 ) *WebhookService {
 	return &WebhookService{
@@ -54,56 +62,81 @@ func NewWebhookService(
 		webhookRepo: webhookRepo,
 		topupCBRepo: topupCBRepo,
 		topupClient: topupClient,
+		provider:    prov,
 		alerter:     alerter,
 		now:         func() time.Time { return time.Now().UTC() },
 	}
 }
 
-// NormalizedWebhook is the format every product-specific webhook handler
-// converts its payload into before calling Process. Keeps the service
-// product-agnostic.
-type NormalizedWebhook struct {
-	EventType        string // "qr.payment", "virtual_account.payment", "invoice.paid"
-	XenditResourceId string // the unique id of THIS webhook event
-	XenditPaymentId  string // id of the payment / invoice object that was paid
-	OrderNo          string // from reference_id / external_id
-	Status           string // SUCCEEDED / PAID / FAILED / EXPIRED ...
-	PaidAmount       int64  // IDR amount actually paid; we cross-check against order.amount_idr
-	Currency         string // expect "IDR"
-	RawPayload       []byte // full JSON, persisted for forensic review
-	Signature        string // copy of the auth header for audit
-	SourceIP         string
+// IncomingWebhook is the wire-side bundle the HTTP handler hands us. It
+// contains the raw payload and headers (for signature verification + audit)
+// plus the source IP for the audit row.
+type IncomingWebhook struct {
+	RawPayload []byte
+	Headers    map[string]string
+	SourceIP   string
 }
 
 // ProcessOutcome carries the result of Process so the handler can reply to
-// Xendit. Xendit treats any non-2xx as "redeliver", so we always 200 OK
-// unless we want a retry.
+// the provider. 200 OK by default; only mid-process DB-write failures get
+// a 5xx (so the provider retries).
 type ProcessOutcome struct {
 	Result  model.WebhookEventProcessResult
 	Code    string // for the response body's "code" field; "ok" / "duplicate" / etc
-	Message string // human-readable; English only (audience is Xendit log)
+	Message string // English; audience is the provider's webhook log
 }
 
-// Process is the entry point. It implements the five-layer defense for one
-// normalized webhook delivery.
-func (s *WebhookService) Process(ctx context.Context, w NormalizedWebhook) ProcessOutcome {
+// Process is the entry point for one webhook delivery.
+//
+//   1. Ask the provider adapter to verify the signature and normalize the payload.
+//   2. INSERT into webhook_events; UNIQUE collision -> duplicate replay.
+//   3. Apply the state-machine update (with SELECT FOR UPDATE).
+//   4. Trigger credit if the event was a successful payment.
+func (s *WebhookService) Process(ctx context.Context, in IncomingWebhook) ProcessOutcome {
+	ev, err := s.provider.VerifyWebhook(ctx, in.RawPayload, in.Headers)
+	if err != nil {
+		if errors.Is(err, provider.ErrInvalidSignature) {
+			logger.L(ctx).Warn("webhook signature verification failed",
+				zap.String("source_ip", in.SourceIP), zap.Error(err))
+			return ProcessOutcome{
+				Result: model.WebhookResultError, Code: "bad_signature",
+				Message: "signature verification failed",
+			}
+		}
+		if errors.Is(err, provider.ErrUnrecognizedEvent) {
+			// Recognized shape, unmapped type. Drop quietly so we don't get
+			// stuck retrying on events we never agreed to handle.
+			logger.L(ctx).Info("webhook ignored (unrecognized event type)")
+			return ProcessOutcome{
+				Result: model.WebhookResultIgnoredNonFinal, Code: "ignored",
+				Message: "event type not handled by this version",
+			}
+		}
+		logger.L(ctx).Error("webhook parse failed", zap.Error(err))
+		return ProcessOutcome{
+			Result: model.WebhookResultError, Code: "parse_error",
+			Message: err.Error(),
+		}
+	}
+
 	ctx = logger.WithFields(ctx,
-		zap.String("event_type", w.EventType),
-		zap.String("resource_id", w.XenditResourceId),
-		zap.String("order_no", w.OrderNo),
+		zap.String("event_type", string(ev.Type)),
+		zap.String("resource_id", ev.ProviderResourceId),
+		zap.String("order_no", ev.OrderNo),
 	)
 
 	// Layer 3: DB-level dedupe.
-	event := &model.WebhookEvent{
-		EventType:        w.EventType,
-		XenditResourceId: w.XenditResourceId,
-		OrderNo:          w.OrderNo,
-		RawPayload:       string(w.RawPayload),
-		Signature:        w.Signature,
-		SourceIP:         w.SourceIP,
-		ReceivedAt:       s.now(),
+	row := &model.WebhookEvent{
+		Provider:           s.provider.Name(),
+		EventType:          string(ev.Type),
+		ProviderResourceId: ev.ProviderResourceId,
+		OrderNo:            ev.OrderNo,
+		RawPayload:         string(in.RawPayload),
+		Signature:          in.Headers["webhook-signature"],
+		SourceIP:           in.SourceIP,
+		ReceivedAt:         s.now(),
 	}
-	if err := s.webhookRepo.Insert(ctx, event); err != nil {
+	if err := s.webhookRepo.Insert(ctx, row); err != nil {
 		if errors.Is(err, repository.ErrDuplicateWebhook) {
 			logger.L(ctx).Info("webhook duplicate (already processed)")
 			return ProcessOutcome{
@@ -118,32 +151,33 @@ func (s *WebhookService) Process(ctx context.Context, w NormalizedWebhook) Proce
 		}
 	}
 
-	outcome := s.processInsertedEvent(ctx, event, w)
-	if err := s.webhookRepo.MarkProcessed(ctx, event.Id, outcome.Result, outcome.Message); err != nil {
+	outcome := s.processInsertedEvent(ctx, row, ev)
+	if err := s.webhookRepo.MarkProcessed(ctx, row.Id, outcome.Result, outcome.Message); err != nil {
 		logger.L(ctx).Error("webhook MarkProcessed failed", zap.Error(err))
 	}
 	return outcome
 }
 
-// processInsertedEvent runs steps 4 and 5 of the defense.
+// processInsertedEvent runs layers 4 and 5 of the defense.
 func (s *WebhookService) processInsertedEvent(
-	ctx context.Context, event *model.WebhookEvent, w NormalizedWebhook,
+	ctx context.Context, row *model.WebhookEvent, ev *provider.NormalizedEvent,
 ) ProcessOutcome {
 
-	if !isTerminalSuccessStatus(w.Status) {
-		logger.L(ctx).Info("webhook ignored (non-terminal status)",
-			zap.String("status", w.Status))
+	// Only act on events that mean "money settled". Other recognized types
+	// (subscription.created etc.) are recorded but not credited in PR-B's scope.
+	if !isCreditTriggering(ev.Type) {
+		logger.L(ctx).Info("webhook recorded; no credit action for this event type")
 		return ProcessOutcome{
 			Result: model.WebhookResultIgnoredNonFinal, Code: "ignored",
-			Message: "non-terminal payment status; nothing to do",
+			Message: "event recorded but no credit action defined",
 		}
 	}
 
-	if w.OrderNo == "" {
-		// Can't even find the order. Probably a payload format issue.
-		s.alerter.NeedsManualReview(ctx, "(unknown)", "webhook has no order_no",
-			zap.String("event_type", w.EventType),
-			zap.String("resource_id", w.XenditResourceId))
+	if ev.OrderNo == "" {
+		s.alerter.NeedsManualReview(ctx, "(unknown)",
+			"webhook has no order_no metadata",
+			zap.String("event_type", string(ev.Type)),
+			zap.String("resource_id", ev.ProviderResourceId))
 		return ProcessOutcome{
 			Result: model.WebhookResultIgnoredNoOrder, Code: "no_order",
 			Message: "webhook payload missing order reference",
@@ -151,10 +185,9 @@ func (s *WebhookService) processInsertedEvent(
 	}
 
 	// Layer 4: order state machine under SELECT FOR UPDATE. We use enum
-	// flags rather than sentinel errors to communicate outcomes, because
-	// returning an error from a GORM Transaction closure rolls back the
-	// transaction - including the status / metadata updates we just made
-	// in the late-callback branch.
+	// flags rather than sentinel errors because returning an error from a
+	// GORM Transaction closure rolls back the tx - and we need the late-
+	// callback metadata + status updates to commit.
 	type txOutcome int
 	const (
 		outcomeCommit txOutcome = iota
@@ -168,21 +201,20 @@ func (s *WebhookService) processInsertedEvent(
 
 	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
-		order, err = s.orderRepo.LockByOrderNo(ctx, tx, w.OrderNo)
+		order, err = s.orderRepo.LockByOrderNo(ctx, tx, ev.OrderNo)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				outcome = outcomeOrderNotFound
-				return nil // commit empty tx; we still inserted the webhook_event in outer scope
+				return nil
 			}
 			return err
 		}
 
-		// Correction 1 & 2: late callbacks against terminal-non-credited orders.
-		// We MUST commit the tx so the metadata + status update land.
+		// Late callback against a terminal-non-credited order.
 		if order.IsPostPayTerminal() {
 			snippet := fmt.Sprintf(
-				"late callback received at %s; webhook_event_id=%d; xendit_payment_id=%s; prior_status=%s",
-				s.now().Format(time.RFC3339), event.Id, w.XenditPaymentId, order.Status,
+				"late callback received at %s; webhook_event_id=%d; provider_payment_id=%s; prior_status=%s",
+				s.now().Format(time.RFC3339), row.Id, ev.ProviderPaymentId, order.Status,
 			)
 			if err := s.orderRepo.AppendMetadata(ctx, tx, order.OrderNo, snippet); err != nil {
 				return fmt.Errorf("append metadata: %w", err)
@@ -193,7 +225,7 @@ func (s *WebhookService) processInsertedEvent(
 				}
 				if err := s.orderRepo.UpdateStatusAndFields(ctx, tx, order.OrderNo,
 					model.StatusNeedsManualReview, map[string]any{
-						"xendit_payment_id": w.XenditPaymentId,
+						"provider_payment_id": ev.ProviderPaymentId,
 					}); err != nil {
 					return err
 				}
@@ -202,8 +234,8 @@ func (s *WebhookService) processInsertedEvent(
 			return nil
 		}
 
-		// pending -> paid (the normal case): record paid_at, persist payment id,
-		// and flag that we should attempt to credit after the tx commits.
+		// pending -> paid: record paid_at + provider_payment_id, flag for
+		// post-tx credit.
 		if order.Status == model.StatusPending {
 			now := s.now()
 			if err := order.CanTransition(model.StatusPaid); err != nil {
@@ -211,34 +243,31 @@ func (s *WebhookService) processInsertedEvent(
 			}
 			if err := s.orderRepo.UpdateStatusAndFields(ctx, tx, order.OrderNo,
 				model.StatusPaid, map[string]any{
-					"paid_at":           now,
-					"xendit_payment_id": w.XenditPaymentId,
+					"paid_at":             now,
+					"provider_payment_id": ev.ProviderPaymentId,
 				}); err != nil {
 				return err
 			}
-			// Keep the in-memory pointer in sync so subsequent (post-tx)
-			// state-machine checks see the new status.
+			// Keep in-memory pointer consistent so post-tx state machine
+			// checks see the new status.
 			order.Status = model.StatusPaid
 			order.PaidAt = &now
 			creditNeeded = true
 			return nil
 		}
 
-		// paid -> still paid: maybe a duplicate event or our previous credit
-		// attempt failed. Re-try the credit, which is itself idempotent.
+		// paid -> still paid: prior credit attempt failed, retry it.
 		if order.Status == model.StatusPaid {
 			creditNeeded = true
 			return nil
 		}
 
-		// credited -> credited: nothing to do, already done.
+		// credited -> credited: done.
 		if order.Status == model.StatusCredited {
 			outcome = outcomeAlreadyCredited
 			return nil
 		}
 
-		// Anything else (refunding etc) shouldn't reach here under the
-		// current state machine, but be defensive.
 		return fmt.Errorf("unexpected order status: %s", order.Status)
 	})
 
@@ -252,19 +281,19 @@ func (s *WebhookService) processInsertedEvent(
 
 	switch outcome {
 	case outcomeOrderNotFound:
-		s.alerter.NeedsManualReview(ctx, w.OrderNo,
+		s.alerter.NeedsManualReview(ctx, ev.OrderNo,
 			"webhook for unknown order_no",
-			zap.String("event_type", w.EventType),
-			zap.String("resource_id", w.XenditResourceId))
+			zap.String("event_type", string(ev.Type)),
+			zap.String("resource_id", ev.ProviderResourceId))
 		return ProcessOutcome{
 			Result: model.WebhookResultIgnoredNoOrder, Code: "no_order",
 			Message: "order_no not found",
 		}
 	case outcomeEscalated:
-		s.alerter.NeedsManualReview(ctx, w.OrderNo,
+		s.alerter.NeedsManualReview(ctx, ev.OrderNo,
 			"late paid webhook against terminal-non-credited order",
-			zap.String("event_type", w.EventType),
-			zap.String("resource_id", w.XenditResourceId))
+			zap.String("event_type", string(ev.Type)),
+			zap.String("resource_id", ev.ProviderResourceId))
 		return ProcessOutcome{
 			Result: model.WebhookResultIgnoredExpired, Code: "ignored_expired",
 			Message: "order already terminal; escalated to needs_manual_review",
@@ -276,29 +305,31 @@ func (s *WebhookService) processInsertedEvent(
 		}
 	}
 
-	// Verification: paid amount should match order amount. A mismatch is a
-	// serious anomaly - probably a user overpaid via VA, or Xendit billed
-	// the wrong amount. Escalate.
-	if w.PaidAmount > 0 && order != nil && w.PaidAmount != order.AmountIDR {
-		s.alerter.NeedsManualReview(ctx, w.OrderNo,
+	// Currency / amount cross-check. A mismatch likely means we mis-priced
+	// the order vs what the provider billed; we still credit at the locked
+	// quota_to_credit but page humans on the delta.
+	if order != nil && ev.AmountUSDCents > 0 && ev.AmountUSDCents != order.AmountUSDCents {
+		s.alerter.NeedsManualReview(ctx, ev.OrderNo,
 			"paid amount does not match order amount",
-			zap.Int64("paid", w.PaidAmount),
-			zap.Int64("expected", order.AmountIDR))
-		// We still credit at order.QuotaToCredit (the locked value) to
-		// avoid awarding more than was promised. Operators handle the
-		// delta out-of-band.
+			zap.Int64("paid_cents", ev.AmountUSDCents),
+			zap.Int64("expected_cents", order.AmountUSDCents))
+	}
+	if order != nil && ev.Currency != "" && ev.Currency != order.Currency {
+		s.alerter.NeedsManualReview(ctx, ev.OrderNo,
+			"paid currency does not match order currency",
+			zap.String("paid_currency", ev.Currency),
+			zap.String("expected_currency", order.Currency))
 	}
 
 	if !creditNeeded {
 		return ProcessOutcome{Result: model.WebhookResultOK, Code: "ok", Message: "no credit needed"}
 	}
 
-	// Layer 5: topup_callbacks UNIQUE + one-api UNIQUE. CreditOrder handles
-	// "already done" by reading the existing callback row.
+	// Layer 5: topup_callbacks UNIQUE + one-api internal_topup_records UNIQUE.
 	if err := s.CreditOrder(ctx, order); err != nil {
 		logger.L(ctx).Error("credit-to-oneapi failed; will retry via cron", zap.Error(err))
 		s.alerter.OneAPIError(ctx, order.OrderNo, "topup", err)
-		// Order stays as 'paid'; topup_retry cron will pick it up.
+		// Order stays in `paid`; topup_retry cron picks it up.
 		return ProcessOutcome{
 			Result: model.WebhookResultError, Code: "credit_failed",
 			Message: "credit deferred to retry: " + err.Error(),
@@ -310,15 +341,6 @@ func (s *WebhookService) processInsertedEvent(
 
 // CreditOrder is the public entry point for crediting a paid order. Used
 // both by Process and by the topup_retry cron.
-//
-// Sequence:
-//  1. INSERT topup_callbacks with status=pending (UNIQUE blocks duplicate).
-//     If already exists and previously succeeded, treat as a no-op.
-//     If already exists but failed, increment attempt and retry.
-//  2. Call one-api /api/internal/topup. The endpoint is itself idempotent.
-//  3. On success: mark callback success, transition order -> credited,
-//     set credited_at + quota_credited.
-//  4. On failure: mark callback failure; leave order in 'paid' so cron retries.
 func (s *WebhookService) CreditOrder(ctx context.Context, order *model.Order) error {
 	const action = model.TopupCallbackActionTopup
 
@@ -334,16 +356,12 @@ func (s *WebhookService) CreditOrder(ctx context.Context, order *model.Order) er
 		if !errors.Is(insertErr, repository.ErrDuplicateTopupCallback) {
 			return fmt.Errorf("topup_callbacks insert: %w", insertErr)
 		}
-		// Already attempted at least once. Reuse the existing row.
 		existing, err := s.topupCBRepo.GetByOrderAction(ctx, order.OrderNo, action)
 		if err != nil {
 			return fmt.Errorf("topup_callbacks reload: %w", err)
 		}
 		cb = existing
 		if cb.IsSuccess() {
-			// Already credited on the one-api side. Make sure our order
-			// reflects that. (Defensive: usually CreditOrder finalizes the
-			// order in the same call that flips the callback.)
 			return s.finalizeCreditedOrder(ctx, order, cb)
 		}
 	}
@@ -353,7 +371,7 @@ func (s *WebhookService) CreditOrder(ctx context.Context, order *model.Order) er
 		OrderNo: order.OrderNo,
 		UserId:  order.UserId,
 		Quota:   order.QuotaToCredit,
-		Remark:  fmt.Sprintf("xendit %s %d IDR", order.PaymentMethod, order.AmountIDR),
+		Remark:  fmt.Sprintf("%s %d %s", order.Provider, order.AmountUSDCents, order.Currency),
 	}
 	reqJSON := mustJSON(req)
 	_ = s.db.WithContext(ctx).
@@ -371,8 +389,6 @@ func (s *WebhookService) CreditOrder(ctx context.Context, order *model.Order) er
 		return fmt.Errorf("one-api refused: http=%d body=%s", result.HTTPStatus, body)
 	}
 	if err := s.topupCBRepo.MarkSuccess(ctx, cb.Id, result.HTTPStatus, result.RawBody); err != nil {
-		// We've actually credited - DB write to mark success failing is a
-		// monitoring concern but the credit is done.
 		logger.L(ctx).Error("topup_callbacks MarkSuccess failed",
 			zap.String("order_no", order.OrderNo), zap.Error(err))
 	}
@@ -384,7 +400,7 @@ func (s *WebhookService) finalizeCreditedOrder(
 	ctx context.Context, order *model.Order, cb *model.TopupCallback,
 ) error {
 	if order.Status == model.StatusCredited {
-		return nil // already finalized
+		return nil
 	}
 	now := s.now()
 	if err := order.CanTransition(model.StatusCredited); err != nil {
@@ -397,11 +413,13 @@ func (s *WebhookService) finalizeCreditedOrder(
 		})
 }
 
-// isTerminalSuccessStatus tells if a Xendit status string means "the user
-// has actually paid". Xendit uses different strings for different products.
-func isTerminalSuccessStatus(status string) bool {
-	switch strings.ToUpper(status) {
-	case "SUCCEEDED", "PAID", "COMPLETED", "SETTLED":
+// isCreditTriggering returns true for normalized event types that mean
+// "money has settled; credit the user."
+func isCreditTriggering(t provider.EventType) bool {
+	switch t {
+	case provider.EventCheckoutCompleted,
+		provider.EventSubscriptionCreated, // first cycle credits on creation
+		provider.EventSubscriptionRenewed:
 		return true
 	}
 	return false
@@ -412,9 +430,6 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-// Indirect for tests; isolated so we can swap to a deterministic encoder
-// later if needed.
 var jsonMarshal = func(v any) ([]byte, error) {
 	return jsonStdMarshal(v)
 }
-

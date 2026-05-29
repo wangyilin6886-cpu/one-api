@@ -1,88 +1,155 @@
 # payment-service
 
-Standalone Go service that creates Xendit top-up orders for one-api users and
-credits one-api on payment confirmation. Targets the Indonesian market;
-currency is IDR, payment methods are QRIS and BCA Virtual Account.
+Standalone Go service that brokers card payments for one-api users worldwide
+via **Polar** (https://polar.sh), a Merchant of Record. Polar handles the
+card processing, global VAT/sales tax, invoicing, and refunds; we listen
+to their webhooks and credit user quota.
 
-This is **PR #2** of three:
+## Pivot history
 
-| PR | Scope |
-|----|-------|
-| #1 | one-api: `POST /api/internal/topup` HMAC-authenticated endpoint |
-| **#2** | **payment-service: order creation, Xendit, webhooks, cron** |
-| #3 | refund flow + admin manual-recovery endpoints |
+| Iteration | Target market | Payment provider | Status |
+|-----------|---------------|------------------|--------|
+| v1 | Indonesia | Xendit (QRIS + BCA VA) | Removed |
+| **v2** | **Global** | **Polar (MoR)** | **In progress** |
 
-## Architecture decision
+## PR roadmap
 
-- **Independent DB schema** (`oneapi_payment`), **independent process**, port 3001.
-- one-api and payment-service share `INTERNAL_API_SECRET` (HMAC-SHA256) for the
-  service-to-service `POST /api/internal/topup` call.
-- Webhook ingestion uses Xendit's per-URL `x-callback-token`, stored in
-  `payment_config` rows so admins can rotate tokens via SQL without a restart.
+| PR | Scope | Status |
+|----|-------|--------|
+| PR #1 | one-api `/api/internal/topup` HMAC-authenticated endpoint | Merged into main |
+| **PR-A** | Delete Xendit; abstract provider interface; reshape schema; trilingual error codes | **This PR** |
+| PR-B | Polar adapter implementation (real `CreateCheckout` + `VerifyWebhook`) + e2e tests | Next |
+| PR-C | Subscriptions: subscriptions table, monthly credit cron, group assignment | After PR-B |
+| PR-D | Refunds + admin manual-recovery endpoints | After PR-C |
+
+## Architecture
+
+```
+        Browser
+           │
+   1. POST /orders {amount_usd_cents:1000}
+           │  (Authorization: <one-api access_token>)
+           ▼
+   ┌──────────────────────┐         ┌─────────────────┐
+   │  payment-service     │ verify  │     one-api     │
+   │  (this repo)         ├────────▶│  /api/user/self │
+   └─────────┬────────────┘         └─────────────────┘
+             │
+             │ 2. POST /v1/checkouts (Polar API)
+             ▼
+   ┌──────────────────────┐
+   │       Polar          │
+   │  (Merchant of Record)│
+   └─────────┬────────────┘
+             │  3. checkout URL
+             │     ◄─────── browser redirected here
+             │
+             │  4. user pays via card (Polar handles 3DS, tax, etc.)
+             │
+             │  5. POST /webhooks/polar (signed)
+             ▼
+   ┌──────────────────────┐         ┌─────────────────┐
+   │  payment-service     │ signed  │    one-api      │
+   │  Process()           ├────────▶│ /api/internal   │
+   │  • verify signature  │ HMAC    │  /topup         │
+   │  • dedupe (5 layers) │         │ credits quota   │
+   │  • credit one-api    │         └─────────────────┘
+   └──────────────────────┘
+```
 
 ## Five-layer idempotency
 
 Top-up correctness rests on five layers; lose any one and we double-credit:
 
-1. **IP whitelist** (`middleware/xendit_ip_whitelist.go`) - rejects non-Xendit IPs.
-2. **Shared-token check** (`middleware/xendit_token.go`) - `x-callback-token` from `payment_config`.
-3. **`UNIQUE(event_type, xendit_resource_id)`** on `webhook_events` - dedupes Xendit retransmissions.
-4. **Order state machine + `SELECT FOR UPDATE`** (`service/webhook_service.go`) -
-   late callbacks against terminal-non-credited orders escalate to `needs_manual_review` (corrections 1, 2).
-5. **`UNIQUE(order_no, action_type)`** on `topup_callbacks` + one-api's
-   `UNIQUE(order_no, action)` on `internal_topup_records` (PR #1) -
-   dedupes outgoing calls to one-api.
+1. **Provider signature verification** -> `provider.Polar.VerifyWebhook`
+2. *(reserved)* IP whitelisting is no longer needed — Polar's HMAC over the
+   body is stronger than CIDR matching.
+3. **`UNIQUE(event_type, provider_resource_id)`** on `webhook_events` -> dedupes provider retransmissions
+4. **Order state machine + `SELECT FOR UPDATE`** in `webhook_service` -> late callbacks against terminal-non-credited orders escalate to `needs_manual_review`
+5. **`UNIQUE(order_no, action_type)`** on `topup_callbacks` + one-api's `UNIQUE(order_no, action)` on `internal_topup_records` -> dedupes outgoing /api/internal/topup calls
 
 ## Directory layout
 
 ```
 payment/
-├── cmd/server/main.go              # entry point
+├── cmd/server/main.go               entry point: config → DB → provider → services → HTTP → cron
 ├── internal/
-│   ├── api/                        # HTTP router + handlers + middleware
+│   ├── api/                         HTTP router + handlers + middleware
 │   │   ├── handler/
+│   │   │   ├── order_handler.go     POST /orders, GET /orders/:no
+│   │   │   ├── webhook_handler.go   POST /webhooks/polar
+│   │   │   └── health_handler.go    GET /healthz
 │   │   ├── middleware/
+│   │   │   ├── user_auth.go         forwards Authorization to one-api /api/user/self
+│   │   │   ├── request_logger.go
+│   │   │   └── helpers.go
 │   │   └── router.go
-│   ├── config/                     # env-var bootstrap
-│   ├── cron/                       # background sweepers
-│   │   ├── expire_orders.go
-│   │   └── topup_retry.go
-│   ├── errors/                     # bilingual error catalog
-│   ├── logger/                     # zap wrapper
-│   ├── model/                      # 5 GORM tables + state machine
-│   ├── repository/                 # DAO
-│   ├── service/                    # business logic
-│   │   ├── order_service.go
-│   │   ├── webhook_service.go
-│   │   ├── topup_client.go         # HMAC-signed call to one-api
-│   │   └── alerter.go              # log-based; Telegram/email later
-│   └── xendit/                     # thin HTTP wrapper (no SDK)
+│   ├── config/config.go             env-var bootstrap
+│   ├── cron/                        background sweepers
+│   │   ├── expire_orders.go         marks pending orders expired
+│   │   └── topup_retry.go           retries failed credit-to-one-api calls
+│   ├── errors/codes.go              en / zh / id trilingual error catalog
+│   ├── logger/logger.go             zap wrapper
+│   ├── model/                       5 GORM tables + state machine
+│   ├── provider/                    payment-provider abstraction
+│   │   ├── provider.go              PaymentProvider interface + normalized types
+│   │   └── polar.go                 Polar adapter (PR-A: stub; PR-B: real)
+│   ├── repository/                  DAO layer
+│   └── service/                     business logic
+│       ├── order_service.go
+│       ├── webhook_service.go
+│       ├── topup_client.go          HMAC-signed call to one-api
+│       └── alerter.go               log-based; Telegram/email later
 ├── migrations/
-│   ├── 00_create_schema.sql        # CREATE DATABASE oneapi_payment (mysql init)
-│   └── 001_initial.sql             # explicit DDL for production review
-├── docs/
-│   └── PR2_test_windows.ps1        # Windows PowerShell e2e test
-├── Dockerfile
+│   ├── 00_create_schema.sql         CREATE DATABASE oneapi_payment (mysql initdb)
+│   └── 001_initial.sql              explicit DDL for production review
+├── Dockerfile                       alpine + curl for healthchecks
 ├── go.mod
 └── README.md
 ```
+
+## Quota pricing (PR-A baseline)
+
+Payment-service does a transparent **1:1 USD → quota** conversion:
+
+```
+quota = floor(amount_usd_cents × 500_000 / 100)
+      = amount_usd_cents × 5_000
+```
+
+Examples:
+
+| USD | Quota |
+|-----|-------|
+| $5  | 2,500,000 |
+| $19 (Pro) | 9,500,000 |
+| $99 (Max) | 49,500,000 |
+
+**Profit margin is taken on the consumption side, NOT here.** Configure
+`group_ratio > 1` in one-api per user group to make each LLM call burn more
+quota than the upstream provider charges. This keeps the payment service's
+pricing logic clean and lets you A/B without touching this codebase.
 
 ## Run locally (docker-compose)
 
 ```sh
 # 1. fill in secrets
 cp .env.example .env
-openssl rand -hex 32           # paste into INTERNAL_API_SECRET
-# paste your Xendit test key into XENDIT_SECRET_KEY
+openssl rand -hex 32          # paste into INTERNAL_API_SECRET
+# paste your Polar SANDBOX access token into POLAR_ACCESS_TOKEN
 
 # 2. start everything
 docker compose up -d
 
-# 3. seed an order (use a valid one-api user access_token)
-curl -X POST http://localhost:3001/orders \
-  -H "Authorization: $ONE_API_USER_ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"amount_idr":50000,"payment_method":"qris"}'
+# 3. after first startup, fill in the runtime config (one-time):
+docker exec -it mysql mysql -u oneapi -p oneapi_payment
+> UPDATE payment_config SET config_value='<polar org id>'         WHERE config_key='polar_organization_id';
+> UPDATE payment_config SET config_value='<polar topup product>'  WHERE config_key='polar_topup_product_id';
+> UPDATE payment_config SET config_value='<polar webhook secret>' WHERE config_key='polar_webhook_secret';
+> exit
+
+# 4. restart payment-service so it picks up the new payment_config
+docker compose restart payment-service
 ```
 
 ## Tests
@@ -92,33 +159,25 @@ cd payment
 go test ./...
 ```
 
-32 tests covering: state machine, exchange-rate lockdown, quota flooring,
-HMAC signing, IP whitelist (incl. XFF trust modes), token verification,
-webhook idempotency, late-callback escalation, retry-safe credit flow.
-
-Service-layer coverage: 77%.
+21 tests covering: state machine, quota math, HMAC signing, webhook
+idempotency, late-callback escalation, retry-safe credit flow. Service-layer
+coverage: ~77%.
 
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/healthz` | none | DB ping, version |
-| POST | `/orders` | user (forwards to one-api `/api/user/self`) | create top-up |
-| GET | `/orders/:order_no` | user | fetch order status |
-| POST | `/webhooks/xendit/qris` | IP + `x-callback-token` | Xendit QRIS event |
-| POST | `/webhooks/xendit/va` | IP + `x-callback-token` | Xendit VA event |
-| POST | `/webhooks/xendit/invoice` | IP + `x-callback-token` | Xendit Invoice event |
+| POST | `/orders` | one-api token | create top-up |
+| GET | `/orders/:order_no` | one-api token | fetch order status |
+| POST | `/webhooks/polar` | HMAC (Polar) | inbound provider event |
 
-PR #3 will add `/admin/*` endpoints for manual recovery.
-
-## Operator checklist before go-live
+## Operator checklist before going live
 
 - [ ] `INTERNAL_API_SECRET` is 64 random hex chars, **identical on both services**
-- [ ] `XENDIT_SECRET_KEY` is the production key (not `xnd_development_*`)
-- [ ] `xendit_ip_whitelist_json` row in `payment_config` is set to Xendit's documented IPs
-      (NOT the default `0.0.0.0/0`)
-- [ ] All three `xendit_webhook_token_*` rows in `payment_config` are filled in
-      with the tokens Xendit assigned to each webhook URL
-- [ ] `PAYMENT_BASE_URL` matches the public hostname the operator gave Xendit
-- [ ] Database backup cron is enabled - the `orders` table is the source of truth
-      for outstanding obligations
+- [ ] `POLAR_ACCESS_TOKEN` is the production token (not `polar_oat_sandbox_*`)
+- [ ] `POLAR_SANDBOX=false` in production
+- [ ] All four Polar values in `payment_config` are filled in (`polar_organization_id`, `polar_topup_product_id`, `polar_webhook_secret`, `checkout_success_url`)
+- [ ] `PAYMENT_BASE_URL` matches the public hostname registered with Polar
+- [ ] Database backup cron is enabled - the `orders` table is the source of truth for outstanding obligations
+- [ ] Polar dashboard's "Restricted countries" list aligned with your sanctions policy (Polar applies defaults, but verify)

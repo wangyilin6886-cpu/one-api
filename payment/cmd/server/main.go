@@ -1,5 +1,5 @@
-// payment-service entry point. Wires config -> DB -> services -> HTTP -> cron,
-// and runs until SIGINT / SIGTERM.
+// payment-service entry point. Wires config -> DB -> provider -> services ->
+// HTTP -> cron, and runs until SIGINT / SIGTERM.
 package main
 
 import (
@@ -25,9 +25,9 @@ import (
 	"github.com/songquanpeng/one-api/payment/internal/cron"
 	"github.com/songquanpeng/one-api/payment/internal/logger"
 	"github.com/songquanpeng/one-api/payment/internal/model"
+	"github.com/songquanpeng/one-api/payment/internal/provider"
 	"github.com/songquanpeng/one-api/payment/internal/repository"
 	"github.com/songquanpeng/one-api/payment/internal/service"
-	"github.com/songquanpeng/one-api/payment/internal/xendit"
 )
 
 func main() {
@@ -56,19 +56,24 @@ func main() {
 		logger.Sys().Fatal("payment_config seed failed", zap.Error(err))
 	}
 
-	// External clients
-	xClient := xendit.New(xendit.Options{
-		BaseURL: cfg.XenditBaseURL, SecretKey: cfg.XenditSecretKey,
-		Timeout: cfg.XenditTimeout, Retries: cfg.XenditRetries,
-	})
+	// Provider. Polar runtime config (webhook secret, org id, product id)
+	// lives in payment_config; we load it here so a misconfigured deploy
+	// fails on startup, not on the first checkout.
+	polarCfg, err := loadPolarConfig(context.Background(), cfg, configRepo)
+	if err != nil {
+		logger.Sys().Fatal("polar config load failed", zap.Error(err))
+	}
+	polarProvider, err := provider.NewPolar(polarCfg)
+	if err != nil {
+		logger.Sys().Fatal("polar provider init failed", zap.Error(err))
+	}
+
 	topupClient := service.NewTopupClient(cfg.OneAPIBaseURL, cfg.OneAPIInternalSecret, cfg.OneAPITimeout)
 
-	// Services
 	alerter := service.NewLogAlerter()
-	orderService := service.NewOrderService(db, orderRepo, configRepo, xClient, alerter)
-	webhookService := service.NewWebhookService(db, orderRepo, webhookRepo, topupCBRepo, topupClient, alerter)
+	orderService := service.NewOrderService(db, orderRepo, configRepo, polarProvider, alerter)
+	webhookService := service.NewWebhookService(db, orderRepo, webhookRepo, topupCBRepo, topupClient, polarProvider, alerter)
 
-	// Router
 	router := api.NewRouter(api.Deps{
 		Cfg: cfg, DB: db,
 		OrderService:   orderService,
@@ -82,12 +87,10 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	// Crons (one goroutine each). Lifetime tied to ctx.
 	ctx, cancel := context.WithCancel(context.Background())
 	go cron.NewExpireOrders(db, orderRepo, cfg.ExpireSweepInterval).Start(ctx)
 	go cron.NewTopupRetry(orderRepo, webhookService, cfg.TopupRetryInterval, cfg.TopupRetryMaxAge).Start(ctx)
 
-	// Serve until signal.
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Sys().Info("listening", zap.Int("port", cfg.Port))
@@ -106,7 +109,7 @@ func main() {
 		logger.Sys().Error("HTTP server failed", zap.Error(err))
 	}
 
-	cancel() // stop crons
+	cancel()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
@@ -115,13 +118,27 @@ func main() {
 	logger.Sys().Info("payment-service stopped")
 }
 
+func loadPolarConfig(ctx context.Context, cfg *config.Config, cr *repository.PaymentConfigRepo) (provider.PolarConfig, error) {
+	all, err := cr.GetAll(ctx)
+	if err != nil {
+		return provider.PolarConfig{}, err
+	}
+	return provider.PolarConfig{
+		AccessToken:    cfg.PolarAccessToken,
+		OrganizationId: all[model.CfgPolarOrgId],
+		ProductTopupId: all[model.CfgPolarTopupProductId],
+		WebhookSecret:  all[model.CfgPolarWebhookSecret],
+		BaseURL:        cfg.PolarBaseURL,
+		SandboxMode:    cfg.PolarSandbox,
+	}, nil
+}
+
 func openDB(cfg *config.Config) (*gorm.DB, error) {
 	gcfg := &gorm.Config{
 		Logger: gormlogger.Default.LogMode(parseGormLogLevel(cfg.DatabaseLogLevel)),
 	}
-	// sqlite:// prefix for tests / single-node demos; otherwise treat as MySQL DSN.
 	if strings.HasPrefix(cfg.DatabaseURL, "sqlite://") {
-		return gorm.Open(sqlite.Open(stripPrefix(cfg.DatabaseURL, "sqlite://")), gcfg)
+		return gorm.Open(sqlite.Open(strings.TrimPrefix(cfg.DatabaseURL, "sqlite://")), gcfg)
 	}
 	return gorm.Open(mysql.Open(cfg.DatabaseURL), gcfg)
 }
@@ -148,8 +165,4 @@ func autoMigrate(db *gorm.DB) error {
 		&model.Refund{},
 		&model.PaymentConfig{},
 	)
-}
-
-func stripPrefix(s, prefix string) string {
-	return strings.TrimPrefix(s, prefix)
 }

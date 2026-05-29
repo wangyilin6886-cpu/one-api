@@ -15,36 +15,71 @@ type PaymentConfig struct {
 
 func (PaymentConfig) TableName() string { return "payment_config" }
 
-// Stable key names. Use these constants instead of raw strings so a typo
+// Stable config keys. Use these constants instead of raw strings so a typo
 // fails to compile.
+//
+// All money values are in USD cents (int64-friendly, no rounding pain).
+// Defaults assume a global LLM top-up service.
 const (
-	CfgExchangeRateIDRPerUSD  = "exchange_rate_idr_per_usd"
-	CfgExchangeRateUpdatedAt  = "exchange_rate_updated_at"
-	CfgMinTopupAmountIDR      = "min_topup_amount_idr"
-	CfgMaxTopupAmountIDR      = "max_topup_amount_idr"
-	CfgOrderExpiryMinutes     = "order_expiry_minutes"
-	CfgXenditWebhookTokenInv  = "xendit_webhook_token_invoice"
-	CfgXenditWebhookTokenVA   = "xendit_webhook_token_va"
-	CfgXenditWebhookTokenQRIS = "xendit_webhook_token_qris"
-	CfgXenditIPWhitelistJSON  = "xendit_ip_whitelist_json"
-	CfgAlertEmail             = "alert_email"
+	// CfgMinTopupCents is the minimum allowed top-up in USD cents. Lower
+	// values get eaten by Polar's flat fee ($0.50). Default: 500 = $5.
+	CfgMinTopupCents = "min_topup_usd_cents"
+
+	// CfgMaxTopupCents prevents single-shot card abuse. Default: 200_000 = $2000.
+	CfgMaxTopupCents = "max_topup_usd_cents"
+
+	// CfgOrderExpiryMinutes is how long an unpaid order lingers before the
+	// cron sweeper marks it expired. Default 30. Polar checkout links
+	// expire on their own ~24h, but our table needs its own clock too.
+	CfgOrderExpiryMinutes = "order_expiry_minutes"
+
+	// CfgPolarWebhookSecret is the HMAC secret Polar prints once when you
+	// register the webhook endpoint. PR-B's signature verifier reads it.
+	CfgPolarWebhookSecret = "polar_webhook_secret"
+
+	// CfgPolarOrgId / CfgPolarTopupProductId let admins swap which Polar
+	// product is mapped to "one-shot top-up" without redeploying.
+	CfgPolarOrgId          = "polar_organization_id"
+	CfgPolarTopupProductId = "polar_topup_product_id"
+
+	// CfgCheckoutSuccessURL / CfgCheckoutCancelURL are the public URLs
+	// Polar redirects the customer to after they close the checkout page.
+	CfgCheckoutSuccessURL = "checkout_success_url"
+	CfgCheckoutCancelURL  = "checkout_cancel_url"
+
+	// CfgAlertEmail receives needs_manual_review notifications.
+	CfgAlertEmail = "alert_email"
 )
 
-// SeedRows returns the initial seed for the payment_config table. The
-// migrate step calls this and inserts each row if not present (idempotent).
-// Sensitive values are deliberately left blank - operators must fill them
-// in via SQL or the admin UI before the corresponding feature works.
+// SeedRows returns the initial seed for the payment_config table.
+// SeedIfMissing inserts only rows that don't yet exist; admins editing
+// values are never overwritten.
+//
+// Sensitive values (secrets) are deliberately left blank - the operator
+// must fill them in before the corresponding feature works. This is
+// captured in the row's `description` so they're discoverable.
 func SeedRows(now time.Time) []PaymentConfig {
 	return []PaymentConfig{
-		{ConfigKey: CfgExchangeRateIDRPerUSD, ConfigValue: "16500", Description: "Locked at order creation. IDR per 1 USD. Edit affects new orders only.", UpdatedAt: now},
-		{ConfigKey: CfgExchangeRateUpdatedAt, ConfigValue: now.UTC().Format(time.RFC3339), Description: "When exchange_rate_idr_per_usd was last edited.", UpdatedAt: now},
-		{ConfigKey: CfgMinTopupAmountIDR, ConfigValue: "10000", Description: "Minimum top-up amount in IDR (rupiah).", UpdatedAt: now},
-		{ConfigKey: CfgMaxTopupAmountIDR, ConfigValue: "10000000", Description: "Maximum top-up amount in IDR (rupiah).", UpdatedAt: now},
-		{ConfigKey: CfgOrderExpiryMinutes, ConfigValue: "30", Description: "Unpaid orders expire after this many minutes.", UpdatedAt: now},
-		{ConfigKey: CfgXenditWebhookTokenInv, ConfigValue: "", Description: "x-callback-token for the Invoice webhook URL. Fill from Xendit dashboard.", UpdatedAt: now},
-		{ConfigKey: CfgXenditWebhookTokenVA, ConfigValue: "", Description: "x-callback-token for the Virtual Account webhook URL.", UpdatedAt: now},
-		{ConfigKey: CfgXenditWebhookTokenQRIS, ConfigValue: "", Description: "x-callback-token for the QRIS webhook URL.", UpdatedAt: now},
-		{ConfigKey: CfgXenditIPWhitelistJSON, ConfigValue: `["0.0.0.0/0"]`, Description: "JSON array of CIDRs allowed to call /webhooks/xendit/*. DEFAULT IS PERMISSIVE - lock down before prod.", UpdatedAt: now},
-		{ConfigKey: CfgAlertEmail, ConfigValue: "", Description: "Email address for needs_manual_review alerts.", UpdatedAt: now},
+		{ConfigKey: CfgMinTopupCents, ConfigValue: "500",
+			Description: "Minimum top-up in USD cents. Default 500 = $5.00.", UpdatedAt: now},
+		{ConfigKey: CfgMaxTopupCents, ConfigValue: "200000",
+			Description: "Maximum top-up in USD cents. Default 200000 = $2000.00.", UpdatedAt: now},
+		{ConfigKey: CfgOrderExpiryMinutes, ConfigValue: "30",
+			Description: "Unpaid orders auto-expire after this many minutes.", UpdatedAt: now},
+
+		{ConfigKey: CfgPolarWebhookSecret, ConfigValue: "",
+			Description: "Polar webhook HMAC secret (shown once at endpoint creation). REQUIRED for signature verification.", UpdatedAt: now},
+		{ConfigKey: CfgPolarOrgId, ConfigValue: "",
+			Description: "Polar organization id (slug or UUID).", UpdatedAt: now},
+		{ConfigKey: CfgPolarTopupProductId, ConfigValue: "",
+			Description: "Polar product id mapped to the one-shot top-up SKU.", UpdatedAt: now},
+
+		{ConfigKey: CfgCheckoutSuccessURL, ConfigValue: "",
+			Description: "Public URL Polar redirects the user to after success. Empty = let Polar use its default.", UpdatedAt: now},
+		{ConfigKey: CfgCheckoutCancelURL, ConfigValue: "",
+			Description: "Public URL Polar redirects the user to on cancel.", UpdatedAt: now},
+
+		{ConfigKey: CfgAlertEmail, ConfigValue: "",
+			Description: "Email address for needs_manual_review and credit-failure alerts.", UpdatedAt: now},
 	}
 }

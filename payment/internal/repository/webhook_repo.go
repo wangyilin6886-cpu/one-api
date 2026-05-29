@@ -17,13 +17,13 @@ type WebhookRepo struct {
 
 func NewWebhookRepo(db *gorm.DB) *WebhookRepo { return &WebhookRepo{db: db} }
 
-// ErrDuplicateWebhook is returned by Insert when (event_type, resource_id)
-// already exists - meaning this is a retransmission from Xendit.
+// ErrDuplicateWebhook is returned by Insert when (event_type, provider_resource_id)
+// already exists - meaning this is a retransmission from the provider.
 var ErrDuplicateWebhook = errors.New("duplicate webhook event")
 
 // Insert stores a fresh webhook arrival. Returns ErrDuplicateWebhook on a
 // composite-key collision, which the caller should treat as a successful
-// idempotent replay (HTTP 200 OK to Xendit).
+// idempotent replay (HTTP 200 OK back to the provider).
 func (r *WebhookRepo) Insert(ctx context.Context, e *model.WebhookEvent) error {
 	if err := r.db.WithContext(ctx).Create(e).Error; err != nil {
 		if IsDuplicateKeyError(err) {
@@ -52,14 +52,14 @@ func (r *WebhookRepo) MarkProcessed(
 		Updates(patch).Error
 }
 
-// GetByResource fetches a webhook by (event_type, xendit_resource_id).
+// GetByResource fetches a webhook by (event_type, provider_resource_id).
 // Returns gorm.ErrRecordNotFound when missing.
 func (r *WebhookRepo) GetByResource(
 	ctx context.Context, eventType, resourceId string,
 ) (*model.WebhookEvent, error) {
 	var e model.WebhookEvent
 	result := r.db.WithContext(ctx).
-		Where("event_type = ? AND xendit_resource_id = ?", eventType, resourceId).
+		Where("event_type = ? AND provider_resource_id = ?", eventType, resourceId).
 		Limit(1).Find(&e)
 	if result.Error != nil {
 		return nil, result.Error

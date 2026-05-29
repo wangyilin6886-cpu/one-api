@@ -2,21 +2,52 @@ package service
 
 import (
 	"context"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/shopspring/decimal"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/songquanpeng/one-api/payment/internal/model"
+	"github.com/songquanpeng/one-api/payment/internal/provider"
 	"github.com/songquanpeng/one-api/payment/internal/repository"
-	"github.com/songquanpeng/one-api/payment/internal/xendit"
 )
+
+// fakeProvider implements provider.PaymentProvider for tests. The two
+// methods can be overridden per-test via the *Fn fields.
+type fakeProvider struct {
+	name             string
+	createCheckoutFn func(ctx context.Context, p provider.CheckoutParams) (*provider.CheckoutResult, error)
+	verifyWebhookFn  func(ctx context.Context, body []byte, headers map[string]string) (*provider.NormalizedEvent, error)
+	createCalls      int32
+}
+
+func (f *fakeProvider) Name() string {
+	if f.name == "" {
+		return "fake"
+	}
+	return f.name
+}
+func (f *fakeProvider) CreateCheckout(ctx context.Context, p provider.CheckoutParams) (*provider.CheckoutResult, error) {
+	atomic.AddInt32(&f.createCalls, 1)
+	if f.createCheckoutFn != nil {
+		return f.createCheckoutFn(ctx, p)
+	}
+	return &provider.CheckoutResult{
+		CheckoutURL:        "https://polar.test/checkout/stub",
+		ProviderCheckoutId: "chk_stub_" + p.OrderNo,
+		ExpiresAt:          time.Now().Add(time.Hour),
+	}, nil
+}
+func (f *fakeProvider) VerifyWebhook(ctx context.Context, body []byte, headers map[string]string) (*provider.NormalizedEvent, error) {
+	if f.verifyWebhookFn != nil {
+		return f.verifyWebhookFn(ctx, body, headers)
+	}
+	return nil, errors.New("not configured")
+}
 
 func setupTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -31,43 +62,43 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// stubXendit serves canned 200 OK responses so OrderService.CreateOrder
-// gets past the network step in unit tests.
-func stubXenditServer(t *testing.T) *httptest.Server {
+func newOrderServiceForTest(t *testing.T, db *gorm.DB) (*OrderService, *repository.PaymentConfigRepo, *fakeProvider) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/qr_codes"):
-			fmt.Fprintf(w, `{"id":"qr_stub_%d","reference_id":"x","qr_string":"00020101..."}`, time.Now().UnixNano())
-		case strings.HasSuffix(r.URL.Path, "/callback_virtual_accounts"):
-			fmt.Fprintf(w, `{"id":"va_stub_%d","external_id":"x","account_number":"8808123456","bank_code":"BCA"}`, time.Now().UnixNano())
-		default:
-			http.Error(w, "unexpected path "+r.URL.Path, 404)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func newOrderServiceForTest(t *testing.T, db *gorm.DB) (*OrderService, *repository.PaymentConfigRepo) {
 	configRepo := repository.NewPaymentConfigRepo(db, 100*time.Millisecond)
 	if err := configRepo.SeedIfMissing(context.Background()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	xs := stubXenditServer(t)
-	xc := xendit.New(xendit.Options{BaseURL: xs.URL, SecretKey: "test", Timeout: time.Second, Retries: 1})
 	orderRepo := repository.NewOrderRepo(db)
-	return NewOrderService(db, orderRepo, configRepo, xc, NewLogAlerter()), configRepo
+	fp := &fakeProvider{name: "polar"}
+	return NewOrderService(db, orderRepo, configRepo, fp, NewLogAlerter()), configRepo, fp
 }
 
-func TestOrderService_CreateOrder_QRIS_HappyPath(t *testing.T) {
+func TestQuotaFromCents(t *testing.T) {
+	cases := []struct {
+		cents int64
+		want  int64
+	}{
+		{500, 2_500_000},      // $5 -> 2.5M quota
+		{1900, 9_500_000},     // $19 (Pro tier)
+		{9900, 49_500_000},    // $99 (Max tier)
+		{100, 500_000},        // exact $1
+		{99, 495_000},         // 99 cents
+		{1, 5000},             // 1 cent
+	}
+	for _, c := range cases {
+		got := QuotaFromCents(c.cents)
+		if got != c.want {
+			t.Errorf("QuotaFromCents(%d) = %d, want %d", c.cents, got, c.want)
+		}
+	}
+}
+
+func TestOrderService_CreateOrder_HappyPath(t *testing.T) {
 	db := setupTestDB(t)
-	svc, _ := newOrderServiceForTest(t, db)
+	svc, _, fp := newOrderServiceForTest(t, db)
 
 	o, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 50_000, PaymentMethod: model.MethodQRIS, ClientIP: "127.0.0.1",
+		UserId: 1, AmountUSDCents: 1000, CustomerEmail: "u@example.com", ClientIP: "127.0.0.1",
 	})
 	if err != nil {
 		t.Fatalf("CreateOrder: %v", err)
@@ -75,130 +106,88 @@ func TestOrderService_CreateOrder_QRIS_HappyPath(t *testing.T) {
 	if o.Status != model.StatusPending {
 		t.Fatalf("status: %s", o.Status)
 	}
-	if !strings.HasPrefix(o.OrderNo, "IDR") || len(o.OrderNo) != 27 {
+	if !strings.HasPrefix(o.OrderNo, "ORD") || len(o.OrderNo) != 27 {
 		t.Fatalf("order_no format: %s", o.OrderNo)
 	}
-	// 50000 IDR * 500000 / 16500 = 1_515_151.515...; floored = 1_515_151
-	if o.QuotaToCredit != 1_515_151 {
-		t.Fatalf("quota: got %d want %d", o.QuotaToCredit, 1_515_151)
+	// $10 -> 1000 cents * 500_000 / 100 = 5_000_000 quota
+	if o.QuotaToCredit != 5_000_000 {
+		t.Fatalf("quota: got %d want %d", o.QuotaToCredit, 5_000_000)
 	}
-	if o.QRString == "" {
-		t.Fatalf("qr_string not attached after Xendit call")
+	if o.Currency != "USD" {
+		t.Fatalf("currency: %s", o.Currency)
 	}
-	if !o.ExchangeRate.Equal(decimal.NewFromInt(16500)) {
-		t.Fatalf("rate: %s", o.ExchangeRate.String())
+	if o.Provider != "polar" {
+		t.Fatalf("provider: %s", o.Provider)
 	}
-}
-
-func TestOrderService_CreateOrder_VABCA_HappyPath(t *testing.T) {
-	db := setupTestDB(t)
-	svc, _ := newOrderServiceForTest(t, db)
-
-	o, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 7, AmountIDR: 100_000, PaymentMethod: model.MethodVABCA, PayerName: "Budi",
-	})
-	if err != nil {
-		t.Fatalf("CreateOrder: %v", err)
+	if o.CheckoutURL == "" {
+		t.Fatalf("checkout url not attached")
 	}
-	if o.VANumber == "" {
-		t.Fatalf("va_number not attached")
+	if !strings.HasPrefix(o.ProviderCheckoutId, "chk_stub_") {
+		t.Fatalf("provider checkout id: %s", o.ProviderCheckoutId)
 	}
-	if o.XenditPaymentChannel != "BCA" {
-		t.Fatalf("channel: %s", o.XenditPaymentChannel)
+	if fp.createCalls != 1 {
+		t.Fatalf("expected 1 provider call, got %d", fp.createCalls)
 	}
 }
 
 func TestOrderService_CreateOrder_AmountBounds(t *testing.T) {
 	db := setupTestDB(t)
-	svc, _ := newOrderServiceForTest(t, db)
+	svc, _, _ := newOrderServiceForTest(t, db)
 
 	_, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 5_000, PaymentMethod: model.MethodQRIS, // below min 10000
+		UserId: 1, AmountUSDCents: 100, // $1, below default min $5
 	})
 	if err != ErrAmountTooLow {
 		t.Fatalf("want ErrAmountTooLow, got %v", err)
 	}
 
 	_, err = svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 20_000_000, PaymentMethod: model.MethodQRIS, // above max 10000000
+		UserId: 1, AmountUSDCents: 1_000_000, // $10_000, above default max $2000
 	})
 	if err != ErrAmountTooHigh {
 		t.Fatalf("want ErrAmountTooHigh, got %v", err)
 	}
 }
 
-func TestOrderService_CreateOrder_UnsupportedMethod(t *testing.T) {
+func TestOrderService_CreateOrder_UnsupportedCurrency(t *testing.T) {
 	db := setupTestDB(t)
-	svc, _ := newOrderServiceForTest(t, db)
+	svc, _, _ := newOrderServiceForTest(t, db)
 
 	_, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 50_000, PaymentMethod: model.PaymentMethod("gopay"),
+		UserId: 1, AmountUSDCents: 1000, Currency: "EUR",
 	})
-	if err != ErrUnsupportedMethod {
-		t.Fatalf("want ErrUnsupportedMethod, got %v", err)
+	if err != ErrUnsupportedCurrency {
+		t.Fatalf("want ErrUnsupportedCurrency, got %v", err)
 	}
 }
 
-func TestOrderService_ExchangeRateLockdown(t *testing.T) {
-	// Correction 3: changing the rate AFTER an order is created must NOT
-	// affect that order's locked quota_to_credit.
+func TestOrderService_CreateOrder_ProviderFails_OrderMarkedFailed(t *testing.T) {
 	db := setupTestDB(t)
-	svc, configRepo := newOrderServiceForTest(t, db)
+	svc, _, fp := newOrderServiceForTest(t, db)
+	fp.createCheckoutFn = func(ctx context.Context, p provider.CheckoutParams) (*provider.CheckoutResult, error) {
+		return nil, errors.New("provider down")
+	}
 
-	o1, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 100_000, PaymentMethod: model.MethodQRIS,
+	o, err := svc.CreateOrder(context.Background(), CreateOrderParams{
+		UserId: 1, AmountUSDCents: 1000,
 	})
-	if err != nil {
-		t.Fatalf("create 1: %v", err)
+	if err == nil {
+		t.Fatal("expected error")
 	}
-	originalRate := o1.ExchangeRate
-	originalQuota := o1.QuotaToCredit
-
-	// Operator changes the rate.
-	if err := configRepo.Set(context.Background(), model.CfgExchangeRateIDRPerUSD, "15000", 0); err != nil {
-		t.Fatalf("set rate: %v", err)
+	if !strings.Contains(err.Error(), "provider down") {
+		t.Fatalf("unexpected err: %v", err)
 	}
-	configRepo.InvalidateCache()
-
-	// Reload o1 and confirm its rate/quota are STILL at the original.
+	// The order row should still exist with status=failed - vital for support.
 	r := repository.NewOrderRepo(db)
-	got, err := r.GetByOrderNo(context.Background(), o1.OrderNo)
-	if err != nil {
-		t.Fatalf("reload: %v", err)
+	got, gerr := r.GetByOrderNo(context.Background(), o.OrderNo)
+	if gerr != nil {
+		t.Fatalf("get: %v", gerr)
 	}
-	if !got.ExchangeRate.Equal(originalRate) {
-		t.Errorf("o1.ExchangeRate drifted: %s -> %s", originalRate, got.ExchangeRate)
+	if got.Status != model.StatusFailed {
+		t.Fatalf("expected failed, got %s", got.Status)
 	}
-	if got.QuotaToCredit != originalQuota {
-		t.Errorf("o1.QuotaToCredit drifted: %d -> %d", originalQuota, got.QuotaToCredit)
-	}
-
-	// New order uses the NEW rate.
-	o2, err := svc.CreateOrder(context.Background(), CreateOrderParams{
-		UserId: 1, AmountIDR: 100_000, PaymentMethod: model.MethodQRIS,
-	})
-	if err != nil {
-		t.Fatalf("create 2: %v", err)
-	}
-	if !o2.ExchangeRate.Equal(decimal.NewFromInt(15000)) {
-		t.Errorf("o2.ExchangeRate should be new rate 15000, got %s", o2.ExchangeRate.String())
-	}
-	if o2.QuotaToCredit <= got.QuotaToCredit {
-		// At lower rate the same IDR amount buys MORE quota.
-		t.Errorf("o2 should credit more quota than o1: %d vs %d", o2.QuotaToCredit, got.QuotaToCredit)
-	}
-}
-
-func TestOrderService_QuotaFloor(t *testing.T) {
-	// quota is always floored - user gets at most what they paid for.
-	// At 100 IDR, rate 16500: quota = floor(100 * 500000 / 16500) = floor(3030.30...) = 3030.
-	// Wait — 100 IDR is below the min, so we can't test directly via CreateOrder.
-	// Test the math via a direct decimal calc using the same formula.
-	amt := decimal.NewFromInt(100)
-	rate := decimal.NewFromInt(16500)
-	quota := amt.Mul(decimal.NewFromInt(QuotaPerUnit)).Div(rate).Floor().IntPart()
-	if quota != 3030 {
-		t.Errorf("quota floor math: got %d want 3030", quota)
+	if got.FailureReason == "" {
+		t.Fatal("expected failure_reason to be set")
 	}
 }
 
@@ -213,7 +202,7 @@ func TestGenerateOrderNo(t *testing.T) {
 		if len(got) != 27 {
 			t.Fatalf("len: %d (%s)", len(got), got)
 		}
-		if !strings.HasPrefix(got, "IDR20260518") {
+		if !strings.HasPrefix(got, "ORD20260518") {
 			t.Fatalf("prefix: %s", got)
 		}
 		if seen[got] {
